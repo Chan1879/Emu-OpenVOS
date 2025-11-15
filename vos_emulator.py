@@ -1599,30 +1599,60 @@ def h_show_commands_status(args: List[str]):
         return _err("usage: show commands status")
     # load the canonical list of commands from the text file
     names = load_txt_commands()
-    implemented: List[str] = []
-    simulated: List[str] = []
-    for name in names:
-        # a command is considered simulated if its name appears in STUB_COMMANDS;
-        # otherwise it is considered implemented
-        if name in STUB_COMMANDS:
-            simulated.append(name)
-        else:
-            implemented.append(name)
+    # Instantiate a temporary shell to ensure the bulk registration has run
+    # and STUB_COMMANDS is populated consistently. This keeps reporting
+    # deterministic whether the function is called from the interactive
+    # shell or directly from scripts.
+    try:
+        tmp_shell = VOShell()
+    except Exception:
+        # If shell instantiation fails for any reason, fall back to the
+        # conservative approach: treat any name present in BUILTINS as
+        # implemented; otherwise simulated.
+        implemented = [n for n in names if n in BUILTINS]
+        simulated = [n for n in names if n not in BUILTINS]
+    else:
+        implemented = [n for n in names if n not in STUB_COMMANDS]
+        simulated = [n for n in names if n in STUB_COMMANDS]
+
     implemented.sort()
     simulated.sort()
-    # build the output with clear section headings
+
+    total = len(names)
+    impl_count = len(implemented)
+    sim_count = len(simulated)
+    pct = (impl_count / total * 100) if total else 0.0
+
+    # Build a richer, colourised report. Use colourama constants so the
+    # interactive shell displays sections clearly. We still return a single
+    # string so callers that print the result (or the shell wrapper) will
+    # display the formatted output.
     lines: List[str] = []
-    lines.append("Implemented commands:")
-    if implemented:
-        lines.extend(implemented)
-    else:
-        lines.append("(none)")
+    header = f"VOS commands report: {total} total, {impl_count} implemented, {sim_count} simulated ({pct:.1f}% implemented)"
+    lines.append(f"{Fore.MAGENTA}{header}{Style.RESET_ALL}")
     lines.append("")
-    lines.append("Not implemented commands:")
-    if simulated:
-        lines.extend(simulated)
+    lines.append(f"{Fore.CYAN}Implemented commands (name - short help):{Style.RESET_ALL}")
+    if implemented:
+        for name in implemented:
+            help_text = HELP_TEXT.get(name, "(no help available)")
+            short = help_text.splitlines()[0]
+            if len(short) > 80:
+                short = short[:77] + "..."
+            lines.append(f"  {Fore.CYAN}{name}{Style.RESET_ALL} - {short}")
     else:
-        lines.append("(none)")
+        lines.append(f"  {Fore.CYAN}(none){Style.RESET_ALL}")
+
+    lines.append("")
+    lines.append(f"{Fore.YELLOW}Simulated (not implemented) commands: (use 'help <name>' or implement handler){Style.RESET_ALL}")
+    if simulated:
+        per_row = 6
+        for i in range(0, len(simulated), per_row):
+            row = simulated[i:i+per_row]
+            coloured = "  " + "  ".join(f"{Fore.LIGHTBLACK_EX}{r}{Style.RESET_ALL}" for r in row)
+            lines.append(coloured)
+    else:
+        lines.append(f"  {Fore.LIGHTBLACK_EX}(none){Style.RESET_ALL}")
+
     return "\n".join(lines)
 
 
@@ -1636,6 +1666,8 @@ ALIASES = {
     # allow quit and q to map to the meta 'exit' command
     "quit": "exit",
     "q": "exit",
+    # convenience alias: 'show commands report' -> 'show commands status'
+    "show commands report": "show commands status",
 }
 
 
@@ -1704,6 +1736,8 @@ BUILTINS: OrderedDict[str, Any] = OrderedDict({
     "update_batch_requests": h_update_batch_requests,
     # command status
     "show commands status": h_show_commands_status,
+    # alternative, more user-friendly name for the same report
+    "show commands report": h_show_commands_status,
 })
 
 
@@ -1795,6 +1829,7 @@ HELP_TEXT: Dict[str, str] = {
     ),
     # command status help
     "show commands status": "Show which commands are implemented versus simulated. Usage: show commands status",
+    "show commands report": "Alias of 'show commands status' with richer reporting. Usage: show commands report",
 }
 
 
@@ -1900,7 +1935,8 @@ class VOShell(Cmd):
             # batch commands
             "batch", "display_batch_status", "list_batch_requests", "cancel_batch_requests", "update_batch_requests",
             # command status
-            "show commands status"
+            "show commands status",
+            "show commands report"
         })
         # Filter self.commands to include only allowed commands
         for k in list(self.commands.keys()):
@@ -1910,6 +1946,17 @@ class VOShell(Cmd):
                 # Remove from stub registry and help if present
                 STUB_COMMANDS.discard(k)
                 HELP_TEXT.pop(k, None)
+        # Remove any commands that are identical to alias keys. Alias keys
+        # are human-friendly mappings and should not appear in the internal
+        # command registry; keeping them can cause ambiguous resolution when
+        # the alias text also exists as a registered command name. Removing
+        # them here prevents that ambiguity while still allowing the alias
+        # to map to the target command.
+        for a in list(ALIASES.keys()):
+            if a in self.commands:
+                del self.commands[a]
+                STUB_COMMANDS.discard(a)
+                HELP_TEXT.pop(a, None)
         # case-insensitive lookups & aliases
         self.aliases: Dict[str, str] = {k.lower(): v for k, v in ALIASES.items()}
         self.commands_ci: Dict[str, Tuple[str, Any]] = {k.lower(): (k, v) for k, v in self.commands.items()}
@@ -2016,6 +2063,13 @@ class VOShell(Cmd):
                 line = mapped.strip()
                 line_lc = line.lower()
                 break
+       # If the expanded full line exactly matches a registered command name,
+        # return it immediately. This avoids ambiguous suggestions when an
+        # alias text also appears in the command index.
+        if line_lc in self.commands_ci:
+            orig, val = self.commands_ci[line_lc]
+            return orig, val, []
+
         # split command and args using current command dictionary
         head, args = _split_cmd_args(line, self.commands_ci)
         if not head:
